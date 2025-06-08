@@ -75,7 +75,7 @@ if uploaded_file is not None:
 
     frame_idx = 0
     progress_bar = st.progress(0)
-    total_frames = int(cap.get(cv2.CAP_PROP_COUNT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) # KORRIGIERT: CAP_PROP_FRAME_COUNT statt CAP_PROP_COUNT
 
     while True:
         ret, frame = cap.read()
@@ -134,8 +134,6 @@ if uploaded_file is not None:
                     speed_pixels_per_frame = distance_pixels / time_diff_frames
                 
                 # Geschwindigkeit in Meter/Sekunde umrechnen
-                # speed_meters_per_second = (speed_pixels_per_frame / pixels_per_meter) * fps
-                # Oder einfacher: speed_meters_per_frame = speed_pixels_per_frame / pixels_per_meter
                 speed_meters_per_sec = (speed_pixels_per_frame / pixels_per_meter) * fps # Hier 'fps' zur Umrechnung von pro Frame zu pro Sekunde
 
                 new_tracked_objects[obj_id] = {
