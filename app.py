@@ -1,6 +1,10 @@
 import streamlit as st
 import cv2
 import numpy as np
+import torch
+
+torch.classes.__path__ = [] 
+
 from ultralytics import YOLO
 import tempfile
 import os
