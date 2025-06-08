@@ -1,6 +1,6 @@
 streamlit
 opencv-python
 numpy
-roboflow==1.1.53  # Behalten Sie diese oder eine andere stabile Version bei
-inference==0.9.11 # Fügen Sie diese Zeile hinzu!
+roboflow
+inference
 supervision
