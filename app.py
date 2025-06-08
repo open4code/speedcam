@@ -4,7 +4,6 @@ from collections import defaultdict, deque
 import cv2
 import numpy as np
 import streamlit as st
-# NEUE IMPORTE
 from roboflow import Roboflow
 
 import supervision as sv
@@ -46,8 +45,8 @@ class ViewTransformer:
 st.title("Fahrzeuggeschwindigkeitserkennung")
 
 # Benutzereingaben für Modell-ID und API-Schlüssel
-# Hinweis: Für ein öffentlicheres Deployment auf Streamlit Share wäre es besser,
-# den API-Key über Streamlit Secrets zu verwalten.
+# Für Streamlit Share wird empfohlen, Secrets zu verwenden.
+# Siehe: https://docs.streamlit.io/deploy/streamlit-cloud/secrets-management
 model_id = st.sidebar.text_input("Roboflow Modell ID (z.B. 'projektname/versionsnummer')", value="yolov8x-640")
 roboflow_api_key = st.sidebar.text_input("Roboflow API KEY", type="password")
 
@@ -61,7 +60,20 @@ iou_threshold = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 st.sidebar.header("Kamera-Einstellungen")
-start_camera = st.sidebar.checkbox("Kamera starten")
+
+# Initialisiere 'start_camera' im Session State, wenn nicht vorhanden
+if "start_camera" not in st.session_state:
+    st.session_state["start_camera"] = False
+
+# Checkbox, die den Zustand in der Session State speichert
+start_camera_checkbox = st.sidebar.checkbox("Kamera starten", value=st.session_state["start_camera"])
+
+# Aktualisiere den Session State basierend auf der Checkbox
+if start_camera_checkbox != st.session_state["start_camera"]:
+    st.session_state["start_camera"] = start_camera_checkbox
+    # Wenn die Kamera ausgeschaltet wird, setze den Kamerastream zurück
+    if not st.session_state["start_camera"]:
+        st.experimental_rerun() # Nötig, um den Stream sofort zu beenden
 
 # Initialisiere die Variable `model` außerhalb des `if`-Blocks
 model = None
@@ -95,14 +107,13 @@ else:
 ## Live-Videoanalyse
 
 # Hauptlogik, wenn die Kamera gestartet wird und das Modell geladen ist
-if start_camera and model:
+if st.session_state["start_camera"] and model:
     st.header("Live-Kamera-Feed")
     st.markdown("---")
 
     # Placeholder für den Kamerastream
     st_frame = st.image([])
 
-    # VideoInfo ist für die Kamera nicht direkt anwendbar, aber wir können Standardwerte annehmen
     assumed_fps = 30 # Angenommene Framerate
     
     # ByteTrack Initialisierung
@@ -139,74 +150,7 @@ if start_camera and model:
     cap = cv2.VideoCapture(0)  # 0 steht für die Standardkamera
 
     if not cap.isOpened():
-        st.error("Kamera konnte nicht geöffnet werden. Stellen Sie sicher, dass keine andere Anwendung die Kamera verwendet.")
+        st.error("Kamera konnte nicht geöffnet werden. Stellen Sie sicher, dass keine andere Anwendung die Kamera verwendet oder die Berechtigungen erteilt wurden.")
     else:
-        # Loop solange die Checkbox aktiviert ist
-        while st.session_state.get("start_camera_state", True): # Überprüfen des Checkbox-Status in Streamlit
+        while st.session_state["start_camera"]: # Loop, solange die Checkbox aktiviert ist
             ret, frame = cap.read()
-            if not ret:
-                st.warning("Kamera konnte keinen Frame empfangen.")
-                break
-
-            # Drehen des Frames bei Bedarf, da viele Webcams spiegelverkehrt sind
-            # frame = cv2.flip(frame, 1)
-
-            # Frame für die Roboflow-Inferenz auf die erwartete Größe anpassen, falls nötig
-            # model.infer() sollte die Größe selbst anpassen, aber wenn Sie spezifische Anforderungen haben,
-            # können Sie hier frame = cv2.resize(frame, (W, H)) hinzufügen.
-
-            results = model.infer(frame)[0]
-            detections = sv.Detections.from_inference(results)
-            detections = detections[detections.confidence > confidence_threshold]
-            detections = detections[polygon_zone.trigger(detections)]
-            detections = detections.with_nms(threshold=iou_threshold)
-            detections = byte_track.update_with_detections(detections=detections)
-
-            points = detections.get_anchors_coordinates(
-                anchor=sv.Position.BOTTOM_CENTER
-            )
-            points = view_transformer.transform_points(points=points).astype(int)
-
-            for tracker_id, [_, y] in zip(detections.tracker_id, points):
-                coordinates[tracker_id].append(y)
-
-            labels = []
-            for tracker_id in detections.tracker_id:
-                if len(coordinates[tracker_id]) < assumed_fps / 2:
-                    labels.append(f"#{tracker_id}")
-                else:
-                    coordinate_start = coordinates[tracker_id][-1]
-                    coordinate_end = coordinates[tracker_id][0]
-                    distance = abs(coordinate_start - coordinate_end)
-                    time = len(coordinates[tracker_id]) / assumed_fps
-                    speed = distance / time * 3.6
-                    labels.append(f"#{tracker_id} {int(speed)} km/h")
-
-            annotated_frame = frame.copy()
-            annotated_frame = trace_annotator.annotate(
-                scene=annotated_frame, detections=detections
-            )
-            annotated_frame = box_annotator.annotate(
-                scene=annotated_frame, detections=detections
-            )
-            annotated_frame = label_annotator.annotate(
-                scene=annotated_frame, detections=detections, labels=labels
-            )
-
-            # Zeigt den annotierten Frame in Streamlit an
-            st_frame.image(annotated_frame, channels="BGR", use_column_width=True)
-
-            # Aktualisieren Sie den Checkbox-Status in Streamlit
-            # Streamlit-Widgets geben ihren Zustand zurück. Wir müssen ihn in der Session State speichern,
-            # um ihn im nächsten Durchlauf des Loops abzurufen.
-            st.session_state["start_camera_state"] = st.sidebar.checkbox("Kamera starten", value=st.session_state.get("start_camera_state", True), key="camera_toggle_loop")
-
-            # Falls der Benutzer die Checkbox deaktiviert hat, beende den Loop
-            if not st.session_state["start_camera_state"]:
-                break # Beendet den while-Loop
-
-        cap.release() # Kamera freigeben, wenn der Loop beendet ist
-        cv2.destroyAllWindows()
-else:
-    if not start_camera:
-        st.info("Klicken Sie auf 'Kamera starten' in der Seitenleiste, um die Geschwindigkeitserkennung zu starten.")
