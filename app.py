@@ -38,8 +38,6 @@ class ViewTransformer:
         transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
         return transformed_points.reshape(-1, 2)
 
----
-
 ## Streamlit App-Konfiguration
 
 st.title("Fahrzeuggeschwindigkeitserkennung")
@@ -101,8 +99,6 @@ if roboflow_api_key:
         model = None
 else:
     st.sidebar.warning("Bitte geben Sie Ihren Roboflow API KEY ein.")
-
----
 
 ## Live-Videoanalyse
 
