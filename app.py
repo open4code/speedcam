@@ -1,221 +1,168 @@
-import streamlit as st
+import argparse
+import os
+from collections import defaultdict, deque
+
 import cv2
 import numpy as np
-import torch
+from inference.models.utils import get_roboflow_model
 
-torch.classes.__path__ = [] 
+import supervision as sv
 
-from ultralytics import YOLO
-import tempfile
-import os
+SOURCE = np.array([[1252, 787], [2298, 803], [5039, 2159], [-550, 2159]])
 
-# --- Konfiguration ---
-MODEL_PATH = 'yolov8n.pt' # Das kleinste YOLOv8 Modell
+TARGET_WIDTH = 25
+TARGET_HEIGHT = 250
 
-# --- Hilfsfunktionen ---
-
-@st.cache_resource
-def load_yolo_model():
-    """Lädt das YOLOv8-Modell und speichert es im Cache."""
-    model = YOLO(MODEL_PATH)
-    return model
-
-def calculate_distance(p1, p2):
-    """Berechnet den euklidischen Abstand zwischen zwei Punkten."""
-    return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-
-def get_centroid(bbox):
-    """Berechnet den Mittelpunkt (x_center, y_center) einer Bounding Box."""
-    x1, y1, x2, y2 = map(int, bbox)
-    return ((x1 + x2) // 2, (y1 + y2) // 2)
-
-# --- Streamlit App ---
-
-st.set_page_config(page_title="Geschwindigkeitsschätzung mit YOLOv8", layout="wide")
-
-st.title("Geschwindigkeitsschätzung mit YOLOv8 (Streamlit)")
-st.markdown("""
-Diese App schätzt die Geschwindigkeit von Objekten in einem Video mit Ultralytics YOLOv8.
-**Hinweis:** Die Geschwindigkeitsberechnung ist eine Näherung und hängt stark von der "Pixel pro Meter"-Kalibrierung ab.
-Für genaue Ergebnisse sind eine Kamerakalibrierung und eine fortgeschrittenere Tracking-Methode erforderlich.
-""")
-
-st.sidebar.header("Einstellungen")
-uploaded_file = st.sidebar.file_uploader("Video hochladen (MP4, AVI, MOV)", type=["mp4", "avi", "mov"])
-confidence_threshold = st.sidebar.slider("Konfidenzschwelle für YOLO-Erkennung", 0.1, 1.0, 0.5, 0.05)
-iou_threshold = st.sidebar.slider("IOU-Schwelle für NMS", 0.1, 1.0, 0.7, 0.05)
-# Kalibrierung für Geschwindigkeit
-pixels_per_meter = st.sidebar.slider("Pixel pro Meter (Kalibrierung)", 10, 500, 100, 10)
+TARGET = np.array(
+    [
+        [0, 0],
+        [TARGET_WIDTH - 1, 0],
+        [TARGET_WIDTH - 1, TARGET_HEIGHT - 1],
+        [0, TARGET_HEIGHT - 1],
+    ]
+)
 
 
-if uploaded_file is not None:
-    st.video(uploaded_file)
+class ViewTransformer:
+    def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
+        source = source.astype(np.float32)
+        target = target.astype(np.float32)
+        self.m = cv2.getPerspectiveTransform(source, target)
 
-    st.info("Video wird verarbeitet... Dies kann je nach Videolänge und Modellgröße einige Zeit dauern.")
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        if points.size == 0:
+            return points
 
-    # Temporäre Datei speichern
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
-        temp_video_file.write(uploaded_file.read())
-        video_path = temp_video_file.name
-
-    model = load_yolo_model()
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        st.error("Fehler beim Öffnen des Videos.")
-        st.stop()
-
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    # Dictionary zum Speichern der Tracking-Informationen
-    # {'object_id': {'last_centroid': (x,y), 'last_frame_idx': int}}
-    tracked_objects = {}
-    next_object_id = 0
-
-    # Liste zum Speichern der verarbeiteten Frames
-    processed_frames = []
-
-    frame_idx = 0
-    progress_bar = st.progress(0)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) # KORRIGIERT: CAP_PROP_FRAME_COUNT statt CAP_PROP_COUNT
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        results = model(frame, conf=confidence_threshold, iou=iou_threshold, verbose=False) # verbose=False für weniger Konsolen-Output
-
-        current_centroids = []
-        current_bboxes = []
-        current_classes = []
-
-        # Extrahieren der Detektionen
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                bbox = box.xyxy[0].cpu().numpy()
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-
-                if conf > confidence_threshold:
-                    current_centroids.append(get_centroid(bbox))
-                    current_bboxes.append(bbox)
-                    current_classes.append(cls)
-
-        # Einfache Tracking-Logik (nahegelegenster Mittelpunkt)
-        new_tracked_objects = {}
-        matched_current_indices = set()
-
-        for obj_id, obj_info in tracked_objects.items():
-            last_centroid = obj_info['last_centroid']
-            min_dist = float('inf')
-            best_match_idx = -1
-
-            for i, current_centroid in enumerate(current_centroids):
-                if i in matched_current_indices: # Bereits zugeordnet
-                    continue
-                dist = calculate_distance(last_centroid, current_centroid)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match_idx = i
-            
-            # Schwellenwert für Matching: Wenn Distanz zu groß, als neues Objekt ansehen
-            if best_match_idx != -1 and min_dist < 100: # 100 Pixel als Beispiel-Schwellenwert
-                matched_current_indices.add(best_match_idx)
-                current_centroid = current_centroids[best_match_idx]
-                current_bbox = current_bboxes[best_match_idx]
-                current_cls = current_classes[best_match_idx]
-
-                # Geschwindigkeit berechnen (Pixel/Frame)
-                distance_pixels = calculate_distance(last_centroid, current_centroid)
-                time_diff_frames = frame_idx - obj_info['last_frame_idx']
-                
-                speed_pixels_per_frame = 0
-                if time_diff_frames > 0:
-                    speed_pixels_per_frame = distance_pixels / time_diff_frames
-                
-                # Geschwindigkeit in Meter/Sekunde umrechnen
-                speed_meters_per_sec = (speed_pixels_per_frame / pixels_per_meter) * fps # Hier 'fps' zur Umrechnung von pro Frame zu pro Sekunde
-
-                new_tracked_objects[obj_id] = {
-                    'last_centroid': current_centroid,
-                    'last_frame_idx': frame_idx,
-                    'speed_mps': speed_meters_per_sec,
-                    'bbox': current_bbox,
-                    'class': current_cls
-                }
-            else:
-                # Objekt nicht gefunden oder zu weit entfernt -> verschwinden lassen
-                pass 
-        
-        # Neue Objekte hinzufügen
-        for i, current_centroid in enumerate(current_centroids):
-            if i not in matched_current_indices:
-                new_tracked_objects[next_object_id] = {
-                    'last_centroid': current_centroid,
-                    'last_frame_idx': frame_idx,
-                    'speed_mps': 0, # Initialgeschwindigkeit 0
-                    'bbox': current_bboxes[i],
-                    'class': current_classes[i]
-                }
-                next_object_id += 1
-        
-        tracked_objects = new_tracked_objects
-
-        # Bounding Boxes und Text auf dem Frame zeichnen
-        for obj_id, obj_info in tracked_objects.items():
-            bbox = obj_info['bbox']
-            x1, y1, x2, y2 = map(int, bbox)
-            centroid_x, centroid_y = obj_info['last_centroid']
-            speed = obj_info['speed_mps']
-            cls = obj_info['class']
-
-            # Klasse aus dem Modell extrahieren (Annahme: Modell hat eine names-Property)
-            class_name = model.names[cls] if hasattr(model, 'names') else f"Class {cls}"
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Text über der Bounding Box
-            text = f"ID: {obj_id} {class_name}"
-            cv2.putText(frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Geschwindigkeitstext unter der Bounding Box
-            speed_text = f"Speed: {speed:.2f} m/s"
-            cv2.putText(frame, speed_text, (x1, y2 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
+        transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
+        return transformed_points.reshape(-1, 2)
 
 
-        # Frame für Streamlit speichern
-        processed_frames.append(frame)
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Vehicle Speed Estimation using Inference and Supervision"
+    )
+    parser.add_argument(
+        "--model_id",
+        default="yolov8x-640",
+        help="Roboflow model ID",
+        type=str,
+    )
+    parser.add_argument(
+        "--roboflow_api_key",
+        default=None,
+        help="Roboflow API KEY",
+        type=str,
+    )
+    parser.add_argument(
+        "--source_video_path",
+        required=True,
+        help="Path to the source video file",
+        type=str,
+    )
+    parser.add_argument(
+        "--target_video_path",
+        required=True,
+        help="Path to the target video file (output)",
+        type=str,
+    )
+    parser.add_argument(
+        "--confidence_threshold",
+        default=0.3,
+        help="Confidence threshold for the model",
+        type=float,
+    )
+    parser.add_argument(
+        "--iou_threshold", default=0.7, help="IOU threshold for the model", type=float
+    )
 
-        frame_idx += 1
-        progress_bar.progress(min((frame_idx / total_frames), 1.0))
+    return parser.parse_args()
 
-    cap.release()
-    os.unlink(video_path) # Temporäre Datei löschen
 
-    st.success("Verarbeitung abgeschlossen!")
+if __name__ == "__main__":
+    args = parse_arguments()
 
-    if processed_frames:
-        # Erstelle ein temporäres Video aus den verarbeiteten Frames
-        output_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Codec für MP4
-        out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+    api_key = args.roboflow_api_key
+    api_key = os.environ.get("ROBOFLOW_API_KEY", api_key)
+    if api_key is None:
+        raise ValueError(
+            "Roboflow API key is missing. Please provide it as an argument or set the "
+            "ROBOFLOW_API_KEY environment variable."
+        )
+    args.roboflow_api_key = api_key
 
-        for frame in processed_frames:
-            out.write(frame)
-        out.release()
+    video_info = sv.VideoInfo.from_video_path(video_path=args.source_video_path)
+    model = get_roboflow_model(model_id=args.model_id, api_key=args.roboflow_api_key)
 
-        st.subheader("Verarbeitetes Video")
-        st.video(output_video_path)
-        os.unlink(output_video_path) # Temporäre Ausgabedatei löschen
-    else:
-        st.warning("Keine Frames verarbeitet oder keine Detektionen gefunden.")
+    byte_track = sv.ByteTrack(
+        frame_rate=video_info.fps, track_activation_threshold=args.confidence_threshold
+    )
 
-else:
-    st.warning("Bitte laden Sie ein Video hoch, um zu beginnen.")
+    thickness = sv.calculate_optimal_line_thickness(
+        resolution_wh=video_info.resolution_wh
+    )
+    text_scale = sv.calculate_optimal_text_scale(resolution_wh=video_info.resolution_wh)
+    box_annotator = sv.BoxAnnotator(thickness=thickness)
+    label_annotator = sv.LabelAnnotator(
+        text_scale=text_scale,
+        text_thickness=thickness,
+        text_position=sv.Position.BOTTOM_CENTER,
+    )
+    trace_annotator = sv.TraceAnnotator(
+        thickness=thickness,
+        trace_length=video_info.fps * 2,
+        position=sv.Position.BOTTOM_CENTER,
+    )
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("© 2025 Deine App")
+    frame_generator = sv.get_video_frames_generator(source_path=args.source_video_path)
+
+    polygon_zone = sv.PolygonZone(polygon=SOURCE)
+    view_transformer = ViewTransformer(source=SOURCE, target=TARGET)
+
+    coordinates = defaultdict(lambda: deque(maxlen=video_info.fps))
+
+    with sv.VideoSink(args.target_video_path, video_info) as sink:
+        for frame in frame_generator:
+            results = model.infer(frame)[0]
+            detections = sv.Detections.from_inference(results)
+            detections = detections[detections.confidence > args.confidence_threshold]
+            detections = detections[polygon_zone.trigger(detections)]
+            detections = detections.with_nms(threshold=args.iou_threshold)
+            detections = byte_track.update_with_detections(detections=detections)
+
+            points = detections.get_anchors_coordinates(
+                anchor=sv.Position.BOTTOM_CENTER
+            )
+            points = view_transformer.transform_points(points=points).astype(int)
+
+            for tracker_id, [_, y] in zip(detections.tracker_id, points):
+                coordinates[tracker_id].append(y)
+
+            labels = []
+            for tracker_id in detections.tracker_id:
+                if len(coordinates[tracker_id]) < video_info.fps / 2:
+                    labels.append(f"#{tracker_id}")
+                else:
+                    coordinate_start = coordinates[tracker_id][-1]
+                    coordinate_end = coordinates[tracker_id][0]
+                    distance = abs(coordinate_start - coordinate_end)
+                    time = len(coordinates[tracker_id]) / video_info.fps
+                    speed = distance / time * 3.6
+                    labels.append(f"#{tracker_id} {int(speed)} km/h")
+
+            annotated_frame = frame.copy()
+            annotated_frame = trace_annotator.annotate(
+                scene=annotated_frame, detections=detections
+            )
+            annotated_frame = box_annotator.annotate(
+                scene=annotated_frame, detections=detections
+            )
+            annotated_frame = label_annotator.annotate(
+                scene=annotated_frame, detections=detections, labels=labels
+            )
+
+            sink.write_frame(annotated_frame)
+            cv2.imshow("frame", annotated_frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+        cv2.destroyAllWindows()
