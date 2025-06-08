@@ -82,7 +82,7 @@ if start_camera and model:
     # VideoInfo ist für die Kamera nicht direkt anwendbar, aber wir können Standardwerte annehmen
     # oder versuchen, die Frame-Rate der Kamera zu ermitteln, falls nötig.
     # Für dieses Beispiel nehmen wir eine feste Framerate an.
-     assumed_fps = 30
+    **assumed_fps = 30** # This line was likely indented incorrectly. Remove any leading spaces/tabs.
     
     # ByteTrack Initialisierung
     byte_track = sv.ByteTrack(
