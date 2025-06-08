@@ -4,7 +4,8 @@ from collections import defaultdict, deque
 import cv2
 import numpy as np
 import streamlit as st
-from inference.models.utils import get_roboflow_model
+# CHANGE THIS LINE:
+from inference import get_model # Import get_model directly from inference
 
 import supervision as sv
 
@@ -63,7 +64,8 @@ model = None
 if roboflow_api_key:
     try:
         # Modell laden
-        model = get_roboflow_model(model_id=model_id, api_key=roboflow_api_key)
+        # CHANGE THIS LINE:
+        model = get_model(model_id=model_id, api_key=roboflow_api_key)
         st.sidebar.success("Roboflow Modell erfolgreich geladen!")
     except Exception as e:
         st.sidebar.error(f"Fehler beim Laden des Roboflow Modells: {e}")
