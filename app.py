@@ -125,7 +125,7 @@ if uploaded_file is not None:
             processed_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
             
             # Zeige den verarbeiteten Frame im Streamlit-Platzhalter an
-            video_placeholder.image(processed_frame_rgb, channels="RGB", use_column_width=True)
+            video_placeholder.image(processed_frame_rgb, channels="RGB", use_container_width=True)
             
             frame_count += 1
             # Aktualisiere den Fortschrittsbalken
