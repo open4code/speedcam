@@ -1,180 +1,160 @@
-import os
-from collections import defaultdict, deque
-
-import cv2
-import numpy as np
 import streamlit as st
-from ultralytics import YOLO # Importiere YOLO von ultralytics
-import supervision as sv
+import cv2
+import torch
+from ultralytics import YOLO
+import numpy as np
+import tempfile
+import os
 
-# --- Konfiguration für Perspektivtransformation (Bleibt gleich) ---
-SOURCE = np.array([[1252, 787], [2298, 803], [5039, 2159], [-550, 2159]])
-TARGET_WIDTH = 25
-TARGET_HEIGHT = 250
-TARGET = np.array(
-    [
-        [0, 0],
-        [TARGET_WIDTH - 1, 0],
-        [TARGET_WIDTH - 1, TARGET_HEIGHT - 1],
-        [0, TARGET_HEIGHT - 1],
-    ]
+# --- Streamlit Page Configuration ---
+st.set_page_config(
+    page_title="Fahrzeug-Erkennung & Zählung",
+    layout="wide", # Macht die App so breit wie möglich
+    initial_sidebar_state="expanded"
 )
 
-class ViewTransformer:
-    def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
-        source = source.astype(np.float32)
-        target = target.astype(np.float32)
-        self.m = cv2.getPerspectiveTransform(source, target)
+st.title("🚗 LKW, Bus und Auto-Erkennung und Zählung aus Video")
+st.markdown("Erkennt und zählt **Autos, Lastwagen und Busse** aus einem hochgeladenen Video mit YOLOv8.")
 
-    def transform_points(self, points: np.ndarray) -> np.ndarray:
-        if points.size == 0:
-            return points
-        reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
-        transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
-        return transformed_points.reshape(-1, 2)
-
-# --- Streamlit App-Konfiguration ---
-st.title("Fahrzeuggeschwindigkeitserkennung")
-
-# Schwellenwerte für Konfidenz und IOU
-confidence_threshold = st.sidebar.slider(
-    "Konfidenz-Schwellenwert", min_value=0.0, max_value=1.0, value=0.3, step=0.05
-)
-iou_threshold = st.sidebar.slider(
-    "IOU-Schwellenwert", min_value=0.0, max_value=1.0, value=0.7, step=0.05
-)
-
-# --- Lokales Modell laden ---
-# WICHTIG: Stelle sicher, dass diese Datei (z.B. best.pt) im selben Verzeichnis wie deine app.py liegt
-LOCAL_MODEL_PATH = "best.pt"
-
-model = None
-if not os.path.exists(LOCAL_MODEL_PATH):
-    st.error(f"Fehler: Modell-Datei '{LOCAL_MODEL_PATH}' nicht gefunden.")
-    st.info("Bitte lade dein Roboflow-Modell (z.B. 'best.pt' als PyTorch-Export) herunter und platziere es im selben Verzeichnis wie diese App-Datei.")
-    st.stop() # Stoppt die Ausführung der App, da das Modell fehlt
-else:
+# --- YOLOv8 Modell laden (wird nur einmal geladen) ---
+@st.cache_resource
+def load_yolo_model():
+    """Lädt das YOLOv8-Modell und cached es."""
+    st.write("Modell wird geladen (kann einen Moment dauern)...")
     try:
-        model = YOLO(LOCAL_MODEL_PATH)
-        st.sidebar.success(f"Modell '{LOCAL_MODEL_PATH}' erfolgreich geladen!")
+        model = YOLO('yolov8n.pt') # Nutze die nano-Version für bessere Performance
+        st.success("Modell erfolgreich geladen!")
+        return model
     except Exception as e:
-        st.error(f"Fehler beim Laden des Modells von '{LOCAL_MODEL_PATH}': {e}")
-        st.info("Stelle sicher, dass es ein gültiges YOLOv8-Modell ist und die 'ultralytics'-Bibliothek korrekt installiert ist.")
-        st.stop() # Stoppt die Ausführung bei einem Fehler beim Laden des Modells
+        st.error(f"Fehler beim Laden des Modells: {e}")
+        st.stop() # Stoppt die App, wenn das Modell nicht geladen werden kann
 
-# --- Kamera-Steuerung ---
-st.sidebar.markdown("---")
-st.sidebar.header("Kamera-Einstellungen")
+model = load_yolo_model()
 
-# Initialisiere 'start_camera' im Session State, um den Zustand beizubehalten
-if "start_camera" not in st.session_state:
-    st.session_state["start_camera"] = False
+# Definiere die Klassen, an denen wir interessiert sind (Namen aus dem COCO-Datensatz)
+# Wir verwenden die Klassennamen und werden ihre IDs dynamisch vom Modell abrufen.
+TARGET_CLASS_NAMES = ['car', 'truck', 'bus']
 
-# Checkbox zum Starten/Stoppen der Kamera
-start_camera_checkbox = st.sidebar.checkbox(
-    "Kamera starten",
-    value=st.session_state["start_camera"],
-    key="main_camera_toggle" # Eindeutiger Schlüssel für die Checkbox
-)
-
-# Aktualisiere den Session State basierend auf der Checkbox
-if start_camera_checkbox != st.session_state["start_camera"]:
-    st.session_state["start_camera"] = start_camera_checkbox
-    if not st.session_state["start_camera"]:
-        st.experimental_rerun() # Erzeugt ein Rerun, um den Video-Loop zu beenden
-
-# --- Live-Videoanalyse ---
-if st.session_state["start_camera"] and model:
-    st.header("Live-Kamera-Feed")
-    st.markdown("---")
-
-    st_frame = st.image([]) # Placeholder für den Kamerastream
-
-    assumed_fps = 30
-    byte_track = sv.ByteTrack(
-        frame_rate=assumed_fps, track_activation_threshold=confidence_threshold
-    )
-
-    # Annotatoren initialisieren (Auflösung kann hier statisch sein, da wir keine VideoInfo haben)
-    assumed_resolution_wh = (640, 480)
-    thickness = sv.calculate_optimal_line_thickness(resolution_wh=assumed_resolution_wh)
-    text_scale = sv.calculate_optimal_text_scale(resolution_wh=assumed_resolution_wh)
-    box_annotator = sv.BoxAnnotator(thickness=thickness)
-    label_annotator = sv.LabelAnnotator(
-        text_scale=text_scale, text_thickness=thickness, text_position=sv.Position.BOTTOM_CENTER
-    )
-    trace_annotator = sv.TraceAnnotator(
-        thickness=thickness, trace_length=assumed_fps * 2, position=sv.Position.BOTTOM_CENTER
-    )
-
-    polygon_zone = sv.PolygonZone(polygon=SOURCE)
-    view_transformer = ViewTransformer(source=SOURCE, target=TARGET)
-
-    coordinates = defaultdict(lambda: deque(maxlen=assumed_fps))
-
-    cap = cv2.VideoCapture(0) # 0 für die Standardkamera
-    if not cap.isOpened():
-        st.error("Fehler: Kamera konnte nicht geöffnet werden.")
-        st.info("Bitte stellen Sie sicher, dass keine andere Anwendung die Kamera verwendet und die Berechtigungen erteilt sind.")
-        st.stop()
-    else:
-        # Loop, solange die 'Kamera starten'-Checkbox aktiviert ist
-        while st.session_state["start_camera"]:
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("Kamera konnte keinen Frame empfangen. Versuche erneut...")
-                continue # Versucht den nächsten Frame
-
-            # Inferenz mit dem lokalen YOLOv8-Modell
-            # conf und iou werden direkt an predict() übergeben
-            results = model.predict(frame, conf=confidence_threshold, iou=iou_threshold, verbose=False)[0]
-            
-            # Konvertiere Ultralytics Results zu Supervision Detections
-            detections = sv.Detections.from_ultralytics(results)
-            
-            # Filterung durch Polygon Zone
-            detections = detections[polygon_zone.trigger(detections)]
-            
-            # ByteTrack Update
-            detections = byte_track.update_with_detections(detections=detections)
-
-            # Punkte transformieren
-            points = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
-            points = view_transformer.transform_points(points=points).astype(int)
-
-            for tracker_id, [_, y] in zip(detections.tracker_id, points):
-                coordinates[tracker_id].append(y)
-
-            labels = []
-            for tracker_id in detections.tracker_id:
-                if len(coordinates[tracker_id]) < assumed_fps / 2:
-                    labels.append(f"#{tracker_id}")
-                else:
-                    coordinate_start = coordinates[tracker_id][-1]
-                    coordinate_end = coordinates[tracker_id][0]
-                    distance = abs(coordinate_start - coordinate_end)
-                    time = len(coordinates[tracker_id]) / assumed_fps
-                    speed = distance / time * 3.6
-                    labels.append(f"#{tracker_id} {int(speed)} km/h")
-
-            # Frame annotieren
-            annotated_frame = frame.copy()
-            annotated_frame = trace_annotator.annotate(scene=annotated_frame, detections=detections)
-            annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
-            annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
-
-            # Zeigt den annotierten Frame in Streamlit an
-            st_frame.image(annotated_frame, channels="BGR", use_column_width=True)
-
-            # Diese zusätzliche Checkbox in der Sidebar wird benötigt, um den Loop zu unterbrechen.
-            # Wenn der Benutzer die Haupt-Checkbox in der Sidebar deaktiviert, wird dies hier
-            # erkannt und der Loop beendet.
-            if not st.sidebar.checkbox("Kamera läuft (deaktivieren zum Stoppen)", value=st.session_state["start_camera"], key="loop_camera_toggle"):
-                st.session_state["start_camera"] = False
-                break
-
-        cap.release() # Kamera freigeben
-        cv2.destroyAllWindows()
+# Erstelle ein Set von Ziel-Klassen-IDs basierend auf den Namen aus dem geladenen Modell
+# Dies ist robuster, da es direkt die Namen aus dem Modell verwendet.
+TARGET_CLASS_IDS = set()
+CLASS_ID_TO_NAME = {} # Mapping von ID zu Klassenname für die Anzeige
+if hasattr(model, 'names') and model.names:
+    for class_id, class_name in model.names.items():
+        if class_name in TARGET_CLASS_NAMES:
+            TARGET_CLASS_IDS.add(class_id)
+            CLASS_ID_TO_NAME[class_id] = class_name
 else:
-    if not st.session_state["start_camera"]:
-        st.info("Klicken Sie auf 'Kamera starten' in der Seitenleiste, um die Geschwindigkeitserkennung zu starten.")
+    st.error("Fehler: Konnte Klassennamen aus dem YOLO-Modell nicht laden. Bitte überprüfe das Modell.")
+    st.stop()
+
+if not TARGET_CLASS_IDS:
+    st.error(f"Fehler: Die gewünschten Klassen {TARGET_CLASS_NAMES} wurden im Modell nicht gefunden. Bitte überprüfe die Klassennamen.")
+    st.stop()
+
+# --- Main Content Area for Video Upload ---
+st.subheader("Video-Datei hochladen zur Fahrzeug-Erkennung")
+uploaded_file = st.file_uploader("Wähle eine Video-Datei aus", type=["mp4", "avi", "mov", "mkv"])
+
+if uploaded_file is not None:
+    st.write("Verarbeite Video...")
+    
+    # Speichere die hochgeladene Datei temporär
+    # tempfile wird verwendet, um eine temporäre Datei sicher zu erstellen und zu verwalten.
+    # delete=False sorgt dafür, dass die Datei nach dem Schließen des Descriptors nicht sofort gelöscht wird.
+    with tempfile.NamedTemporaryFile(delete=False) as tfile:
+        tfile.write(uploaded_file.read())
+        temp_file_path = tfile.name
+    
+    # Streamlit placeholder für die verarbeiteten Video-Frames
+    video_placeholder = st.empty()
+
+    # Initialisiere den Video-Capture-Objekt mit der temporären Datei
+    cap = cv2.VideoCapture(temp_file_path)
+    
+    if not cap.isOpened():
+        st.error("Fehler: Konnte Video-Datei nicht öffnen.")
+    else:
+        # Hole die Gesamtanzahl der Frames für den Fortschrittsbalken
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        progress_bar = st.progress(0)
+        frame_count = 0
+
+        # Schleife durch jeden Frame des Videos
+        while cap.isOpened():
+            ret, frame = cap.read() # Lese den nächsten Frame
+            if not ret:
+                # Wenn keine Frames mehr vorhanden sind oder ein Fehler auftritt, beende die Schleife
+                break
+            
+            # --- Frame-Verarbeitung (Vehicle Detection Logic) ---
+            # Konvertiere den Frame von BGR (OpenCV-Standard) zu RGB für YOLO
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Führe die Objekterkennung mit dem YOLO-Modell durch
+            results = model(rgb_frame, verbose=False) # verbose=False unterdrückt Konsolenausgaben von YOLO
+
+            vehicle_count = 0 # Zähler für erkannte Fahrzeuge
+            annotated_frame = frame.copy() # Erstelle eine Kopie des Original-Frames zum Zeichnen
+            
+            # Überprüfe, ob Ergebnisse vorhanden sind und verarbeite sie
+            if results and len(results) > 0:
+                detections = results[0].boxes # Greife auf die erkannten Bounding Boxes zu
+                for box in detections:
+                    # Überprüfe, ob die erkannte Klasse eine unserer Ziel-Fahrzeugklassen ist
+                    if int(box.cls) in TARGET_CLASS_IDS:
+                        vehicle_count += 1 # Erhöhe den Fahrzeugzähler
+                        # Extrahiere die Koordinaten der Bounding Box und die Konfidenz
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        confidence = box.conf[0]
+                        detected_class_name = CLASS_ID_TO_NAME.get(int(box.cls), "Unbekannt") # Hol den Namen
+
+                        # Zeichne ein Rechteck um das erkannte Fahrzeug
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2) # Grün, 2px Dicke
+                        # Füge ein Label mit der Klasse und Konfidenz hinzu
+                        label = f"{detected_class_name.capitalize()}: {confidence:.2f}"
+                        cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # Zeige die Gesamtzahl der erkannten Fahrzeuge im Frame an
+            count_text = f"Fahrzeuge: {vehicle_count}"
+            cv2.putText(annotated_frame, count_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+            
+            # --- Ende der Frame-Verarbeitung ---
+
+            # Konvertiere den annotierten Frame wieder zu RGB für die Anzeige in Streamlit
+            processed_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            
+            # Zeige den verarbeiteten Frame im Streamlit-Platzhalter an
+            video_placeholder.image(processed_frame_rgb, channels="RGB", use_column_width=True)
+            
+            frame_count += 1
+            # Aktualisiere den Fortschrittsbalken
+            progress_bar.progress(frame_count / total_frames)
+
+        # Gib das Video-Capture-Objekt frei und schließe es
+        cap.release()
+        progress_bar.empty() # Entferne den Fortschrittsbalken nach Abschluss
+        st.success("Video-Verarbeitung abgeschlossen!")
+        
+        # Lösche die temporäre Datei
+        os.unlink(temp_file_path)
+
+else:
+    st.info("Bitte lade eine Video-Datei hoch, um die Erkennung zu starten.")
+
+# Add a simple footer with custom CSS for better styling
+st.markdown("""
+<style>
+    /* Allgemeine Anpassungen für den Hauptcontainer */
+    .reportview-container .main .block-container{
+        padding-top: 1rem;
+        padding-right: 1rem;
+        padding-left: 1rem;
+        padding-bottom: 1rem;
+    }
+    /* Stellt sicher, dass das Video gut in den Container passt */
+    .stImage > img {
+        object-fit: contain;
+    }
+</style>
+""", unsafe_allow_html=True)
